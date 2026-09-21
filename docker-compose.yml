@@ -1,0 +1,57 @@
+# OCT 规范表面审计台 —— full stack.
+#
+# Host ports are configurable via a .env file (or shell environment):
+#   WEB_PORT  (default 8080)  -> http://localhost:${WEB_PORT}
+#   API_PORT  (default 8000)  -> http://localhost:${API_PORT}
+#
+# Everyday run:
+#   docker compose up --build
+# End-to-end acceptance (one-shot, reports via exit code):
+#   docker compose run --rm verify
+
+services:
+  api:
+    build:
+      context: ./backend
+    image: oct-surface-api:latest
+    container_name: oct-surface-api
+    environment:
+      # Same-host browser calls go through nginx; permissive CORS only
+      # matters for direct API_PORT access during local auditing.
+      CORS_ORIGINS: "*"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    restart: unless-stopped
+    # Health check is declared in the backend Dockerfile (GET /health).
+
+  web:
+    build:
+      context: ./frontend
+    image: oct-surface-web:latest
+    container_name: oct-surface-web
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    # Health check is declared in the frontend Dockerfile (GET /healthz,
+    # which itself proxies the API readiness path in nginx config).
+
+  verify:
+    build:
+      context: ./verify
+    image: oct-surface-verify:latest
+    container_name: oct-surface-verify
+    profiles: ["verify"]
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    environment:
+      WEB_URL: http://web
+      API_URL: http://api:8000
+    # One-shot acceptance job: runs over HTTP then exits; its container
+    # exit code is the acceptance verdict (0 pass, non-zero fail).
+    restart: "no"
