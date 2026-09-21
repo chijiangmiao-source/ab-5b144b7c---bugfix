@@ -14,9 +14,15 @@ Checks:
      right, independently confirmed by an exhaustive brute force;
   4. tie handling (canonical lexicographic minimum + optional depths);
   5. infeasible problem reporting;
-  6. invalid input is rejected with located causes;
-  7. flat row-major costs are accepted;
-  8. a maximum-size (40x40x64) request with 102 400 integers is accepted.
+  6. the reported all-zero 4x4x10 volume: exact canonical surface, exact
+     per-column optional sets, uniqueness fields, and a pinned re-solve of
+     every depth confirming each optional depth is realisable at cost 0
+     and every other depth is infeasible;
+  7. the same invariants on varied all-zero volumes (different sizes,
+     depths, slopes, scattered forbidden voxels);
+  8. invalid input is rejected with located causes;
+  9. flat row-major costs are accepted;
+  10. a maximum-size (40x40x64) request with 102 400 integers is accepted.
 
 Exits 0 only if every check passes; prints one FAIL line per failure.
 """
@@ -182,6 +188,124 @@ def main() -> int:
           f"status={status} body={body}")
     check("infeasible has no cost/surface",
           body.get("optimal_cost") is None and body.get("canonical_depth") is None)
+
+    # ---- Reported all-zero 4x4x10 volume ---------------------------------
+    # Regression: every feasible surface is optimal here; the canonical
+    # surface must be the row-major lexicographic minimum and each column's
+    # optional set must list exactly the depths some optimal surface uses.
+    print("\n== all-zero 4x4x10 volume with scattered forbidden voxels ==")
+    zforb = [[0, 0, 4], [0, 0, 5], [1, 1, 0], [1, 1, 9], [2, 2, 3], [3, 3, 7]]
+    zero = {"rows": 4, "cols": 4, "depth": 10, "s": 1,
+            "costs": [0] * (4 * 4 * 10), "forbidden": zforb}
+    exp_canon = [[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    exp_opts = [[list(range(10)) for _ in range(4)] for _ in range(4)]
+    exp_opts[0][0] = [0, 1, 2, 3, 6, 7, 8, 9]
+    exp_opts[1][1] = [1, 2, 3, 4, 5, 6, 7, 8]
+    exp_opts[2][2] = [0, 1, 2, 4, 5, 6, 7, 8, 9]
+    exp_opts[3][3] = [0, 1, 2, 3, 4, 5, 6, 8, 9]
+    status, body = post_json(f"{API}/api/solve", zero)
+    check("zero volume feasible with cost 0",
+          status == 200 and body.get("status") == "feasible"
+          and body.get("optimal_cost") == 0,
+          f"status={status} body={str(body)[:200]}")
+    if status == 200 and body.get("status") == "feasible":
+        check("zero volume canonical is lexicographic min",
+              body["canonical_depth"] == exp_canon,
+              str(body["canonical_depth"]))
+        check("zero volume optional sets exact",
+              body["optional_depths"] == exp_opts,
+              str(body["optional_depths"]))
+        check("zero volume non-unique with 16 ambiguous columns",
+              body["unique"] is False and body["ambiguous_columns"] == 16,
+              f"unique={body.get('unique')} ambiguous={body.get('ambiguous_columns')}")
+        check("zero volume canonical depths are optional and not forbidden",
+              all(body["canonical_depth"][i][j] in body["optional_depths"][i][j]
+                  and [i, j, body["canonical_depth"][i][j]] not in zforb
+                  for i in range(4) for j in range(4)))
+        check("zero volume optional sets contain no forbidden voxel",
+              all(k not in body["optional_depths"][i][j] for i, j, k in zforb))
+
+        # Pin every column to every depth in turn (temporary extra forbidden
+        # voxels): optional depths must stay feasible at total cost 0 with
+        # the pinned depth selected; every other depth must be infeasible.
+        pin_failures = []
+        for i in range(4):
+            for j in range(4):
+                for a in range(10):
+                    pin = dict(zero)
+                    pin["forbidden"] = zforb + [
+                        [i, j, k] for k in range(10)
+                        if k != a and [i, j, k] not in zforb
+                    ]
+                    st2, b2 = post_json(f"{API}/api/solve", pin)
+                    if a in exp_opts[i][j]:
+                        ok = (st2 == 200 and b2.get("status") == "feasible"
+                              and b2.get("optimal_cost") == 0
+                              and b2["canonical_depth"][i][j] == a)
+                    else:
+                        ok = st2 == 200 and b2.get("status") == "infeasible"
+                    if not ok:
+                        pin_failures.append(f"({i},{j}) depth {a}")
+        check("pinned re-solve confirms every optional depth",
+              not pin_failures, ", ".join(pin_failures[:5]))
+
+    # ---- Varied all-zero volumes ------------------------------------------
+    # Same invariants at slightly different sizes/depths/slopes with
+    # scattered forbidden voxels, so the fix cannot be instance-specific.
+    print("\n== varied all-zero volumes ==")
+    varied = [
+        {"rows": 3, "cols": 4, "depth": 8, "s": 1,
+         "forbidden": [[0, 1, 3], [1, 0, 0], [1, 2, 7], [2, 3, 2], [2, 0, 5],
+                       [0, 3, 6]]},
+        {"rows": 5, "cols": 3, "depth": 12, "s": 2,
+         "forbidden": [[0, 0, 6], [1, 1, 11], [2, 2, 0], [3, 0, 4], [4, 2, 8],
+                       [2, 0, 9], [0, 2, 3]]},
+        {"rows": 4, "cols": 4, "depth": 6, "s": 3,
+         "forbidden": [[0, 3, 5], [3, 0, 0], [1, 2, 2], [2, 1, 4]]},
+    ]
+    for vi, vp in enumerate(varied):
+        vr, vc, vd = vp["rows"], vp["cols"], vp["depth"]
+        vp["costs"] = [0] * (vr * vc * vd)
+        status, body = post_json(f"{API}/api/solve", vp)
+        ok = status == 200 and body.get("status") == "feasible"
+        check(f"varied[{vi}] feasible with cost 0",
+              ok and body["optimal_cost"] == 0,
+              f"status={status} body={str(body)[:200]}")
+        if not ok:
+            continue
+        canon, opts = body["canonical_depth"], body["optional_depths"]
+        forb = {tuple(t) for t in vp["forbidden"]}
+        inv = all(
+            canon[i][j] in opts[i][j]
+            and canon[i][j] == min(opts[i][j])
+            and (i, j, canon[i][j]) not in forb
+            and all((i, j, k) not in forb for k in opts[i][j])
+            for i in range(vr) for j in range(vc)
+        )
+        amb = sum(1 for i in range(vr) for j in range(vc) if len(opts[i][j]) != 1)
+        check(f"varied[{vi}] canonical/optional/forbidden invariants", inv)
+        check(f"varied[{vi}] uniqueness fields consistent",
+              body["ambiguous_columns"] == amb and body["unique"] is (amb == 0))
+        pin_bad = []
+        for i in range(vr):
+            for j in range(vc):
+                for a in range(vd):
+                    pin = dict(vp)
+                    pin["forbidden"] = vp["forbidden"] + [
+                        [i, j, k] for k in range(vd)
+                        if k != a and (i, j, k) not in forb
+                    ]
+                    st2, b2 = post_json(f"{API}/api/solve", pin)
+                    if a in opts[i][j]:
+                        good = (st2 == 200 and b2.get("status") == "feasible"
+                                and b2.get("optimal_cost") == 0
+                                and b2["canonical_depth"][i][j] == a)
+                    else:
+                        good = st2 == 200 and b2.get("status") == "infeasible"
+                    if not good:
+                        pin_bad.append(f"({i},{j}) depth {a}")
+        check(f"varied[{vi}] pinned re-solve matches optional sets",
+              not pin_bad, ", ".join(pin_bad[:5]))
 
     # ---- Invalid input with located causes ------------------------------
     print("\n== invalid input ==")

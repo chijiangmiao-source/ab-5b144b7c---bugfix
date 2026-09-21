@@ -17,47 +17,6 @@ from __future__ import annotations
 from collections import deque
 
 
-class ResidualReachability:
-    __slots__ = ("dag", "position", "furthest", "exact")
-
-    def __init__(self, dag: list[set[int]], topo: list[int]):
-        self.dag = dag
-        self.position = [0] * len(dag)
-        for index, component in enumerate(topo):
-            self.position[component] = index
-
-        self.furthest = list(self.position)
-        for component in reversed(topo):
-            endpoint = self.furthest[component]
-            for successor in dag[component]:
-                endpoint = max(endpoint, self.furthest[successor])
-            self.furthest[component] = endpoint
-
-        self.exact: dict[int, int] | None = {} if len(dag) <= 128 else None
-
-    def _exact_bits(self, start: int) -> int:
-        cached = self.exact.get(start)
-        if cached is not None:
-            return cached
-        seen = 1 << start
-        stack = [start]
-        while stack:
-            component = stack.pop()
-            for successor in self.dag[component]:
-                bit = 1 << successor
-                if not seen & bit:
-                    seen |= bit
-                    stack.append(successor)
-        self.exact[start] = seen
-        return seen
-
-    def reaches(self, start: int, target: int) -> bool:
-        if self.exact is not None:
-            return bool((self._exact_bits(start) >> target) & 1)
-        target_position = self.position[target]
-        return target_position <= self.furthest[start]
-
-
 class ISAP:
     __slots__ = ("n", "head", "to", "nxt", "cap", "dist", "cnt")
 
@@ -213,6 +172,24 @@ class ISAP:
                 e = nxt[e]
         return seen
 
+    def reachable_to(self, t: int) -> list[bool]:
+        """Nodes that can reach t over residual arcs (sink min-cut side)."""
+        seen = [False] * self.n
+        seen[t] = True
+        stack = [t]
+        head, to, nxt, cap = self.head, self.to, self.nxt, self.cap
+        while stack:
+            u = stack.pop()
+            e = head[u]
+            while e != -1:
+                v = to[e]
+                # residual arc v -> u exists iff the twin arc has capacity
+                if cap[e ^ 1] > 0 and not seen[v]:
+                    seen[v] = True
+                    stack.append(v)
+                e = nxt[e]
+        return seen
+
     def residual_graph(self) -> tuple[list[list[int]], list[list[int]]]:
         g: list[list[int]] = [[] for _ in range(self.n)]
         gr: list[list[int]] = [[] for _ in range(self.n)]
@@ -228,8 +205,8 @@ class ISAP:
                 e = nxt[e]
         return g, gr
 
-    def residual_reachability(self, s: int, t: int):
-        """SCC ids (Kosaraju) and condensation reachability as int bitsets."""
+    def residual_scc(self) -> list[int]:
+        """Strongly connected component ids of the residual graph (Kosaraju)."""
         g, gr = self.residual_graph()
         n = self.n
 
@@ -267,27 +244,4 @@ class ISAP:
                         stack.append(v)
             cid += 1
 
-        dag_sets: list[set[int]] = [set() for _ in range(cid)]
-        for u in range(n):
-            cu = comp[u]
-            for v in g[u]:
-                cv = comp[v]
-                if cv != cu:
-                    dag_sets[cu].add(cv)
-        indeg = [0] * cid
-        for outs in dag_sets:
-            for cv in outs:
-                indeg[cv] += 1
-        queue = [c for c in range(cid) if indeg[c] == 0]
-        topo: list[int] = []
-        qh = 0
-        while qh < len(queue):
-            cu = queue[qh]
-            qh += 1
-            topo.append(cu)
-            for cv in dag_sets[cu]:
-                indeg[cv] -= 1
-                if indeg[cv] == 0:
-                    queue.append(cv)
-
-        return comp, ResidualReachability(dag_sets, topo)
+        return comp

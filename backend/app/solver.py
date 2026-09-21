@@ -31,23 +31,27 @@ to an integer s-t minimum cut (the monotone-chain construction):
   v(q,k+S) -> v(p,k) in both directions for each 4-neighbour pair.
 
 Maximum flow is computed with a hand-written, integer-capacity
-Boykov-Kolmogorov search-tree implementation in ``bk.py``.  After the
-flow, strongly connected
-components of the residual graph plus reachability on the condensation
-DAG classify every threshold node exactly:
+ISAP (improved shortest augmenting path) implementation in
+``isap.py``.  After the flow, the residual graph classifies every
+threshold node exactly (the Picard-Queyranne min-cut lattice):
 
-* reachable from the source  -> source side in EVERY minimum cut;
-* able to reach the sink      -> sink   side in EVERY minimum cut;
-* otherwise                   -> free across optimal surfaces.
+* the set reachable from the source is the component-wise smallest
+  minimum cut, hence its labels are exactly the lexicographically
+  smallest row-major depth vector among all optima;
+* the set of nodes that can reach the sink is the complement of the
+  component-wise largest minimum cut;
+* depth a is attainable at column t in some optimal surface iff the
+  cut may simultaneously put v(t,a) on the source side and v(t,a+1)
+  on the sink side: v(t,a) cannot reach the sink, the source cannot
+  reach v(t,a+1), and no residual path v(t,a) ~> v(t,a+1) exists.
+  The infinite chain arc v(t,a+1) -> v(t,a) always keeps residual
+  capacity (total flow is strictly below "infinite" whenever the
+  instance is feasible), so the last condition holds exactly when
+  the two thresholds lie in different strongly connected components.
 
-The residual-reachable set from the source is itself a minimum cut and is
-the component-wise smallest one, hence its labels are exactly the
-lexicographically smallest row-major depth vector among all optima.
-Depth a is attainable at column t in some optimal surface iff the cut may
-simultaneously put v(t,a) on the source side and v(t,a+1) on the sink
-side: v(t,a) cannot reach the sink, the source cannot reach v(t,a+1),
-and no residual path v(t,a) ~> v(t,a+1) exists (the min-cut lattice
-separation criterion).
+All three conditions are evaluated exactly: one residual BFS from the
+source, one reverse residual BFS from the sink, and one Kosaraju SCC
+decomposition -- no approximation is involved at any problem size.
 """
 
 from __future__ import annotations
@@ -344,15 +348,19 @@ def solve(payload: dict) -> SolveResult:
 
     optimal_cost = flow + int(offset)
 
-    # Residual SCC + condensation reachability answers every membership
-    # question in O(1) bitset tests afterwards:
+    # Exact Picard-Queyranne classification of the residual graph:
     #   * the source-reachable set is the canonical (smallest) min cut;
+    #   * the nodes that can reach the sink form the sink-forced region
+    #     (complement of the largest min cut);
     #   * label a is attainable at column t iff v(t,a) can be source-side
-    #     (cannot reach sink), v(t,a+1) can be sink-side (source cannot
-    #     reach it), and no residual path v(t,a) ~> v(t,a+1) exists
-    #     (otherwise that path would force an infinite chain edge cut).
-    comp, reachability = net.residual_reachability(s_node, t_node)
-    c_source, c_sink = comp[s_node], comp[t_node]
+    #     (cannot reach the sink), v(t,a+1) can be sink-side (unreachable
+    #     from the source), and the two thresholds are not forced into
+    #     the same cut side.  The infinite chain arc v(t,a+1) -> v(t,a)
+    #     always keeps residual capacity (flow < inf), so a residual path
+    #     v(t,a) ~> v(t,a+1) exists iff both share an SCC.
+    from_source = net.reachable_from(s_node)
+    to_sink = net.reachable_to(t_node)
+    comp = net.residual_scc()
 
     canonical = [[0] * c for _ in range(r)]
     optional = [[[] for _ in range(c)] for _ in range(r)]
@@ -364,17 +372,16 @@ def solve(payload: dict) -> SolveResult:
             # Canonical depth: highest source-reachable threshold.
             z = 0
             for k in range(1, d):
-                if reachability.reaches(c_source, comp[v(t, k)]):
+                if from_source[v(t, k)]:
                     z = k
             canonical[i][j] = z
 
             opts = []
             for a in range(d):
                 node_a, node_b = v(t, a), v(t, a + 1)
-                na, nb1 = comp[node_a], comp[node_b]
-                can_source = not reachability.reaches(na, c_sink)
-                can_sink = not reachability.reaches(c_source, nb1)
-                not_forced = not reachability.reaches(na, nb1)
+                can_source = not to_sink[node_a]
+                can_sink = not from_source[node_b]
+                not_forced = comp[node_a] != comp[node_b]
                 if can_source and can_sink and not_forced:
                     opts.append(a)
             optional[i][j] = opts
