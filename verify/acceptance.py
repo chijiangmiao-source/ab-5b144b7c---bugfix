@@ -14,9 +14,15 @@ Checks:
      right, independently confirmed by an exhaustive brute force;
   4. tie handling (canonical lexicographic minimum + optional depths);
   5. infeasible problem reporting;
-  6. invalid input is rejected with located causes;
-  7. flat row-major costs are accepted;
-  8. a maximum-size (40x40x64) request with 102 400 integers is accepted.
+  6. forbidden voxels in uniform-cost volumes: exact canonical surface and
+     per-column optional sets on a reference 4x4x10 instance (also via the
+     web tier), no forbidden voxel ever canonical/optional, every optional
+     depth witnessed by an optimal-cost surface (re-solved with the column
+     pinned to that depth), canonical surface is the row-major
+     lexicographic minimum -- repeated on further sizes/depths/slopes;
+  7. invalid input is rejected with located causes;
+  8. flat row-major costs are accepted;
+  9. a maximum-size (40x40x64) request with 102 400 integers is accepted.
 
 Exits 0 only if every check passes; prints one FAIL line per failure.
 """
@@ -182,6 +188,161 @@ def main() -> int:
           f"status={status} body={body}")
     check("infeasible has no cost/surface",
           body.get("optimal_cost") is None and body.get("canonical_depth") is None)
+
+    # ---- Forbidden voxels: canonical/optional exactness ------------------
+    # Uniform-cost volumes with scattered forbidden voxels.  The canonical
+    # surface must avoid forbidden voxels, every optional depth must be
+    # witnessed by an optimal-cost surface (verified by re-solving with
+    # the column pinned to that depth), and the canonical surface must be
+    # the row-major lexicographic minimum.
+    print("\n== forbidden voxels never canonical/optional ==")
+
+    def pinned(payload, fixed):
+        p = dict(payload)
+        d = payload["depth"]
+        forb = {tuple(t) for t in payload.get("forbidden", [])}
+        for (i, j), a in fixed.items():
+            forb |= {(i, j, k) for k in range(d) if k != a}
+        p["forbidden"] = [list(t) for t in sorted(forb)]
+        return p
+
+    def audit_uniform(payload, label, expect=None):
+        r, c, d = payload["rows"], payload["cols"], payload["depth"]
+        forbidden = {(i, j, k) for i, j, k in payload.get("forbidden", [])}
+        uniform = payload["costs"][0]
+        status, body = post_json(f"{API}/api/solve", payload)
+        ok = status == 200 and body.get("status") == "feasible"
+        check(f"{label}: feasible", ok, f"status={status} body={str(body)[:200]}")
+        if not ok:
+            return
+        opt = body["optimal_cost"]
+        canon, optional = body["canonical_depth"], body["optional_depths"]
+        check(f"{label}: optimal cost exact",
+              opt == uniform * r * c, f"{opt} != {uniform * r * c}")
+        if expect is not None:
+            exp_canon, exp_opts = expect
+            check(f"{label}: canonical surface exact", canon == exp_canon,
+                  f"{canon} != {exp_canon}")
+            got = [[optional[i][j] for j in range(c)] for i in range(r)]
+            check(f"{label}: optional sets exact", got == exp_opts,
+                  f"{got} != {exp_opts}")
+        struct_ok = True
+        n_amb = 0
+        for i in range(r):
+            for j in range(c):
+                opts = optional[i][j]
+                if (not opts or canon[i][j] not in opts
+                        or (i, j, canon[i][j]) in forbidden
+                        or {(i, j, k) for k in opts} & forbidden):
+                    struct_ok = False
+                if len(opts) != 1:
+                    n_amb += 1
+        check(f"{label}: canonical optional, nothing forbidden listed",
+              struct_ok)
+        check(f"{label}: uniqueness fields consistent",
+              body["ambiguous_columns"] == n_amb
+              and body["unique"] == (n_amb == 0),
+              f"unique={body['unique']} ambiguous={body['ambiguous_columns']} "
+              f"expected {n_amb}")
+
+        # Witness property in both directions: depth a is optional at
+        # (i, j) iff pinning that column to a keeps an optimal-cost
+        # surface attainable.
+        witness_bad = ""
+        for i in range(r):
+            for j in range(c):
+                for a in range(d):
+                    _, sub = post_json(f"{API}/api/solve",
+                                       pinned(payload, {(i, j): a}))
+                    attainable = (sub.get("status") == "feasible"
+                                  and sub.get("optimal_cost") == opt)
+                    if attainable != (a in optional[i][j]):
+                        witness_bad = (f"({i},{j}) depth {a}: optional="
+                                       f"{a in optional[i][j]} but pinned "
+                                       f"solve -> {sub.get('status')}/"
+                                       f"{sub.get('optimal_cost')}")
+                        break
+                if witness_bad:
+                    break
+            if witness_bad:
+                break
+        check(f"{label}: every optional depth witnessed at optimal cost",
+              not witness_bad, witness_bad)
+
+        # Lexicographic minimum: pin the row-major prefix to the canonical
+        # depths; the next column's smallest optional depth must equal its
+        # canonical depth.
+        lex_bad = ""
+        for t in range(r * c):
+            i, j = divmod(t, c)
+            prefix = {(ii, jj): canon[ii][jj]
+                      for ii, jj in (divmod(u, c) for u in range(t))}
+            _, sub = post_json(f"{API}/api/solve", pinned(payload, prefix))
+            if (sub.get("status") != "feasible"
+                    or sub.get("optimal_cost") != opt
+                    or min(sub["optional_depths"][i][j]) != canon[i][j]):
+                lex_bad = (f"prefix up to ({i},{j}): canonical "
+                           f"{canon[i][j]}, got {sub.get('status')}/"
+                           f"{sub.get('optimal_cost')}/"
+                           f"{sub.get('optional_depths', [[None]])[i][j]}")
+                break
+        check(f"{label}: canonical surface is lexicographic minimum",
+              not lex_bad, lex_bad)
+
+    main_case = {
+        "rows": 4, "cols": 4, "depth": 10, "s": 1,
+        "costs": [0] * 160,
+        "forbidden": [[0, 0, 4], [0, 0, 5], [1, 1, 0], [1, 1, 9],
+                      [2, 2, 3], [3, 3, 7]],
+    }
+    full10 = list(range(10))
+    main_opts = {(0, 0): [0, 1, 2, 3, 6, 7, 8, 9],
+                 (1, 1): [1, 2, 3, 4, 5, 6, 7, 8],
+                 (2, 2): [0, 1, 2, 4, 5, 6, 7, 8, 9],
+                 (3, 3): [0, 1, 2, 3, 4, 5, 6, 8, 9]}
+    audit_uniform(
+        main_case, "4x4x10 s=1",
+        expect=([[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                [[main_opts.get((i, j), full10) for j in range(4)]
+                 for i in range(4)]))
+    # The reference instance must also report full ambiguity.
+    status, body = post_json(f"{API}/api/solve", main_case)
+    check("4x4x10 s=1: fully ambiguous, non-unique",
+          status == 200 and body.get("unique") is False
+          and body.get("ambiguous_columns") == 16,
+          f"unique={body.get('unique')} ambiguous={body.get('ambiguous_columns')}")
+    # Same instance through the WEB tier (nginx -> FastAPI).
+    status, body = post_json(f"{WEB}/api/solve", main_case)
+    check("4x4x10 s=1: identical via web tier",
+          status == 200
+          and body.get("canonical_depth") == [[0, 0, 0, 0], [0, 1, 0, 0],
+                                              [0, 0, 0, 0], [0, 0, 0, 0]]
+          and body.get("optional_depths", [[[]]])[1][1]
+          == [1, 2, 3, 4, 5, 6, 7, 8],
+          f"status={status}")
+
+    variants = [
+        ("5x3x12 s=2", {"rows": 5, "cols": 3, "depth": 12, "s": 2,
+                        "costs": [0] * (5 * 3 * 12),
+                        "forbidden": [[0, 1, 0], [1, 0, 11], [2, 2, 5],
+                                      [3, 1, 3], [4, 0, 8], [4, 2, 2],
+                                      [0, 0, 6]]}),
+        ("3x5x9 s=1", {"rows": 3, "cols": 5, "depth": 9, "s": 1,
+                       "costs": [0] * (3 * 5 * 9),
+                       "forbidden": [[0, 0, 8], [0, 4, 0], [1, 2, 4],
+                                     [2, 1, 6], [2, 3, 2], [1, 0, 5]]}),
+        ("4x4x11 s=3", {"rows": 4, "cols": 4, "depth": 11, "s": 3,
+                        "costs": [0] * (4 * 4 * 11),
+                        "forbidden": [[0, 3, 10], [1, 1, 1], [2, 0, 7],
+                                      [3, 2, 4], [3, 3, 0], [0, 0, 5]]}),
+        ("4x3x8 s=1 cost7", {"rows": 4, "cols": 3, "depth": 8, "s": 1,
+                             "costs": [7] * (4 * 3 * 8),
+                             "forbidden": [[0, 0, 0], [1, 1, 3],
+                                           [2, 2, 7], [3, 0, 5]]}),
+    ]
+    for label, payload in variants:
+        audit_uniform(payload, label)
+
 
     # ---- Invalid input with located causes ------------------------------
     print("\n== invalid input ==")

@@ -10,52 +10,16 @@ Only one reverse BFS from the sink is performed; afterwards distances
 are maintained by relabelling.  An empty distance level triggers the
 gap heuristic (every node above the gap can never reach the sink again).
 The augmenting-path DFS is iterative.
+
+After the flow, :meth:`ISAP.mincut_classification` derives the exact
+min-cut-lattice (Picard-Queyranne) facts the solver needs from two
+breadth-first searches plus one Kosaraju pass -- no transitive closure
+is ever approximated, so the answers are exact at every graph size.
 """
 
 from __future__ import annotations
 
 from collections import deque
-
-
-class ResidualReachability:
-    __slots__ = ("dag", "position", "furthest", "exact")
-
-    def __init__(self, dag: list[set[int]], topo: list[int]):
-        self.dag = dag
-        self.position = [0] * len(dag)
-        for index, component in enumerate(topo):
-            self.position[component] = index
-
-        self.furthest = list(self.position)
-        for component in reversed(topo):
-            endpoint = self.furthest[component]
-            for successor in dag[component]:
-                endpoint = max(endpoint, self.furthest[successor])
-            self.furthest[component] = endpoint
-
-        self.exact: dict[int, int] | None = {} if len(dag) <= 128 else None
-
-    def _exact_bits(self, start: int) -> int:
-        cached = self.exact.get(start)
-        if cached is not None:
-            return cached
-        seen = 1 << start
-        stack = [start]
-        while stack:
-            component = stack.pop()
-            for successor in self.dag[component]:
-                bit = 1 << successor
-                if not seen & bit:
-                    seen |= bit
-                    stack.append(successor)
-        self.exact[start] = seen
-        return seen
-
-    def reaches(self, start: int, target: int) -> bool:
-        if self.exact is not None:
-            return bool((self._exact_bits(start) >> target) & 1)
-        target_position = self.position[target]
-        return target_position <= self.furthest[start]
 
 
 class ISAP:
@@ -228,11 +192,39 @@ class ISAP:
                 e = nxt[e]
         return g, gr
 
-    def residual_reachability(self, s: int, t: int):
-        """SCC ids (Kosaraju) and condensation reachability as int bitsets."""
+    def mincut_classification(self, s: int, t: int):
+        """Exact min-cut-lattice classification of every node.
+
+        Returns ``(comp, source_side, sink_reaching)``:
+
+        * ``source_side[v]``   -- v is reachable from s over residual arcs,
+          i.e. v lies on the source side of EVERY minimum s-t cut (the
+          source-reachable set is itself the component-wise smallest cut);
+        * ``sink_reaching[v]`` -- v can reach t over residual arcs, i.e. v
+          lies on the sink side of EVERY minimum cut;
+        * ``comp[v]``          -- id of v's strongly connected component in
+          the residual graph (Kosaraju).  Two nodes can be separated by a
+          minimum cut iff they sit in different components AND neither
+          side is forced by the two reachability sets above.
+        """
         g, gr = self.residual_graph()
         n = self.n
 
+        source_side = self.reachable_from(s)
+
+        # Nodes that can reach t: BFS from t over reversed residual arcs.
+        sink_reaching = [False] * n
+        sink_reaching[t] = True
+        stack = [t]
+        while stack:
+            u = stack.pop()
+            for v in gr[u]:
+                if not sink_reaching[v]:
+                    sink_reaching[v] = True
+                    stack.append(v)
+
+        # Kosaraju: first pass orders nodes by finishing time on g, second
+        # pass expands components on gr.
         visited = bytearray(n)
         order: list[int] = []
         for start in range(n):
@@ -267,27 +259,4 @@ class ISAP:
                         stack.append(v)
             cid += 1
 
-        dag_sets: list[set[int]] = [set() for _ in range(cid)]
-        for u in range(n):
-            cu = comp[u]
-            for v in g[u]:
-                cv = comp[v]
-                if cv != cu:
-                    dag_sets[cu].add(cv)
-        indeg = [0] * cid
-        for outs in dag_sets:
-            for cv in outs:
-                indeg[cv] += 1
-        queue = [c for c in range(cid) if indeg[c] == 0]
-        topo: list[int] = []
-        qh = 0
-        while qh < len(queue):
-            cu = queue[qh]
-            qh += 1
-            topo.append(cu)
-            for cv in dag_sets[cu]:
-                indeg[cv] -= 1
-                if indeg[cv] == 0:
-                    queue.append(cv)
-
-        return comp, ResidualReachability(dag_sets, topo)
+        return comp, source_side, sink_reaching
